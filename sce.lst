@@ -1,0 +1,1189 @@
+               .deffile adi_defs__0.asm
+               .deffile ddi_defs__0.asm
+               .deffile reg_defs__0.asm
+               .deffile sce_defs__0.asm
+
+               ; Number of supported tasks
+               .define TASK_COUNT      2
+
+               ; Resource-specified definitions, if any
+               .define AUXIO_I2C_SCL           11
+               .define AUXIO_I2C_SDA           2
+               .define I2C_BASE_DELAY          55
+               .define I2C_EXT_DELAY           4
+               .define I2C_STRETCH_TIMEOUT_US  100
+               .define I2C_WAIT_STRETCH_DELAY  5
+
+
+               .segment begin "Framework"
+
+
+               VectorTable:
+0000 ---- 1408                         jsr         PowerUp
+0001 ---- 040c                         jmp         TaskCtrlReqVector
+0002 ---- 1408                         jsr         PowerUp
+0003 ---- 042c                         jmp         AonRtcCh2Vector
+0004 ---- 1408                         jsr         PowerUp
+0005 ---- 0447                         jmp         Event0Vector
+0006 ---- 1408                         jsr         PowerUp
+0007 ---- 044d                         jmp         TaskAlertAckVector
+
+
+
+
+               PowerUp:
+                                       ; Deassert the power-down request
+0008 ---- 4436                         iobclr      #0, [#IOP_WUC_PWRDWNREQ]
+
+                                       ; Wait for it to take effect
+0009 ---- 2437 /waitForPdAck:          iobtst      #0, [#IOP_WUC_PWRDWNACK]
+000a ---- aefe                         biob1       /waitForPdAck
+
+               FwEmptyFunc:            ; Done
+000b ---- adb7                         rts
+
+
+
+
+               TaskCtrlReqVector:
+                                       ; Clear the vector flag
+000c ---- 6442                         iobset      #0, [#IOP_EVCTL_VECFLAGSCLR]
+
+                                       ; For each task ...
+000d ---- 7000                         ld          R7, #0
+               /loop:
+                                           ; Save the task ID
+000e ---- 7c6f                             st          R7, [#fwCtrlInt/taskId]
+
+                                           ; Handle initialize request, if any
+000f ---- 6876                             ld          R6, [#fwCtrlExt/bvTaskInitializeReq]
+0010 ---- 0069                             ld          R0, #pFwTaskInitializeFuncTable
+0011 ---- 1425                             jsr         /handleReq
+
+                                           ; Handle execute request, if any
+0012 ---- 6877                             ld          R6, [#fwCtrlExt/bvTaskExecuteReq]
+0013 ---- 006b                             ld          R0, #pFwTaskExecuteFuncTable
+0014 ---- 1425                             jsr         /handleReq
+
+                                           ; Handle terminate request, if any
+0015 ---- 6878                             ld          R6, [#fwCtrlExt/bvTaskTerminateReq]
+0016 ---- 006d                             ld          R0, #pFwTaskTerminateFuncTable
+0017 ---- 1425                             jsr         /handleReq
+
+                                           ; Move on to the next task
+0018 ---- 786f                             ld          R7, [#fwCtrlInt/taskId]
+0019 ---- f801                             add         R7, #1
+
+001a ---- fa02                         cmp         R7, #TASK_COUNT
+001b ---- bef2                         bneq        /loop
+
+                                       ; Update which tasks are ...
+001c ---- 7874                         ld          R7, [#fwCtrlExt/bvActiveTasks]
+                                       ; ... currently active ...
+001d ---- 6876                         ld          R6, [#fwCtrlExt/bvTaskInitializeReq]
+001e ---- fd0e                         or          R7, R6
+                                       ; ... and inactive ...
+001f ---- 6878                         ld          R6, [#fwCtrlExt/bvTaskTerminateReq]
+0020 ---- ed92                         inv         R6
+0021 ---- fd06                         and         R7, R6
+0022 ---- 7c74                         st          R7, [#fwCtrlExt/bvActiveTasks]
+
+                                       ; We're READY for another request
+0023 ---- 642d                         iobset      #IOB_EVCTL_SWEV_READY, [#IOP_EVCTL_SWEVSET]
+
+                                       ; Generate an ALERT interrupt if needed before powering back down
+0024 ---- 0450                         jmp         GenAlertInterrupt;
+
+               /handleReq:
+                                       ; Restore the task ID, and load the function pointer (here to avoid pipeline hazard)
+0025 ---- 786f                         ld          R7, [#fwCtrlInt/taskId]
+0026 ---- 8f1f                         ld          R0, [R7+R0]
+
+                                       ; Skip this request?
+0027 ---- ed8f                         lsr         R6, R7
+0028 ---- ec01                         tst         R6, #0x0001
+0029 ---- be01                         bnz         /noSkip
+002a ---- adb7                             rts
+               /noSkip:
+                                       ; Make the call by jump, with return (rts) in the "called" function
+002b ---- 8db7                         jmp         R0
+
+
+
+
+               AonRtcCh2Vector:
+                                       ; Start clearing the RTC event
+002c ---- 6630                         iobset      #IOB_WUC_WUEV_RTC, [#IOP_WUC_WUEVCLR]
+
+                                       ; Clear the vector flag
+002d ---- 6542                         iobset      #1, [#IOP_EVCTL_VECFLAGSCLR]
+
+                                       ; For each task (R0 is the current task ID) ...
+002e ---- 0000                         ld          R0, #0
+               /loop:
+                                           ; ... that is active ...
+002f ---- 1874                             ld          R1, [#fwCtrlExt/bvActiveTasks]
+0030 ---- 9d88                             lsr         R1, R0
+0031 ---- 9c01                             tst         R1, #0x0001
+0032 ---- b60d                             bz          /skip
+
+                                               ; Fetch number of RTC intervals until next execution
+0033 ---- 1067                                 ld          R1, #pFwTaskExecuteScheduleTable
+0034 ---- af19                                 ld          R2, [R1+R0]
+
+                                               ; If not already 0, decrement and store. If then 0 ...
+0035 ---- aa00                                 cmp         R2, #0
+0036 ---- b609                                 beq         /skip
+0037 ---- a8ff                                 add         R2, #-1
+0038 ---- af39                                 st          R2, [R1+R0]
+0039 ---- be06                                 bnz         /skip
+
+                                                   ; ... execute the task
+003a ---- 0c6f                                     st          R0, [#fwCtrlInt/taskId]
+003b ---- 886b                                     add         R0, #pFwTaskExecuteFuncTable
+003c ---- 8f08                                     ld          R0, [R0]
+                                                   ; Insert NOP to avoid pipeline hazard
+003d ---- fd47                                     nop
+003e ---- 9db7                                     jsr         R0
+003f ---- 086f                                     ld          R0, [#fwCtrlInt/taskId]
+               /skip:
+                                           ; Move on to the next task
+0040 ---- 8801                             add         R0, #1
+
+0041 ---- 8a02                         cmp         R0, #TASK_COUNT
+0042 ---- beec                         bneq        /loop
+
+                                       ; Wait for the ACK event to be cleared
+0043 ---- 262f /waitOnRtcClearing:     iobtst      #IOB_WUC_WUEV_RTC, [#IOP_WUC_WUEVFLAGS]
+0044 ---- aefe                         biob1       /waitOnRtcClearing
+0045 ---- 4630                         iobclr      #IOB_WUC_WUEV_RTC, [#IOP_WUC_WUEVCLR]
+
+                                       ; Generate an ALERT interrupt if needed
+0046 ---- 0450                         jmp         GenAlertInterrupt;
+
+
+
+
+               Event0Vector:
+                                       ; Disable and clear the vector flag
+0047 ---- 5527                         iobclr      #IOB_EVCTL_VECCFG1_VEC2_EN, [#IOP_EVCTL_VECCFG1]
+0048 ---- 6642                         iobset      #2, [#IOP_EVCTL_VECFLAGSCLR]
+
+                                       ; Set the task ID
+0049 ---- 0000                         ld          R0, #0
+004a ---- 0c6f                         st          R0, [#fwCtrlInt/taskId]
+
+                                       ; Jump to the event task code
+004b ---- 140b                         jsr         FwEmptyFunc
+
+                                       ; Generate an ALERT interrupt if needed
+004c ---- 0450                         jmp         GenAlertInterrupt;
+
+
+
+
+               TaskAlertAckVector:
+                                       ; Clear the vector flag
+004d ---- 6742                         iobset      #3, [#IOP_EVCTL_VECFLAGSCLR]
+
+                                       ; Re-enable generation of ALERT interrupts
+004e ---- 03ff                         ld          R0, #-1
+004f ---- 0c71                         st          R0, [#fwCtrlInt/alertGenMask]
+
+                                       ; Fall through to GenAlertInterrupt to generate another ALERT interrupt if needed
+
+
+
+
+               GenAlertInterrupt:
+                                       ; Do we have any ALERT-generating flags pending?
+0050 ---- 7870                         ld          R7, [#fwCtrlInt/bvTaskIoAlert]
+
+                                       ; Skip if the last I/O ALERT interrupt has not been acknowledged
+0051 ---- 6871                         ld          R6, [#fwCtrlInt/alertGenMask]
+0052 ---- ed37                         tst         R6, R7
+0053 ---- b605                         bz          /skipAlertGen
+
+                                           ; Transfer I/O flags from internal to external
+0054 ---- 0000                             ld          R0, #0
+0055 ---- 0c70                             st          R0, [#fwCtrlInt/bvTaskIoAlert]
+0056 ---- 7c75                             st          R7, [#fwCtrlExt/bvTaskIoAlert]
+
+                                           ; Generate the ALERT interrupt, and clear the generation mask
+0057 ---- 652d                             iobset      #IOB_EVCTL_SWEV_ALERT, [#IOP_EVCTL_SWEVSET]
+0058 ---- 0c71                             st          R0, [#fwCtrlInt/alertGenMask]
+               /skipAlertGen:
+                                       ; Fall through to PowerDown ...
+
+
+
+
+               PowerDown:
+                                       ; If there are no unacknowledged ALERTs and no vectors pending ...
+0059 ---- 7871                         ld          R7, [#fwCtrlInt/alertGenMask]
+005a ---- 6872                         ld          R6, [#fwCtrlInt/alertCanPdAuxMask]
+005b ---- fd0e                         or          R7, R6
+005c ---- f801                         add         R7, #1 ; 0xFFFF -> 0x0000
+005d ---- e92b                         in          R6, [#IOP_EVCTL_VECFLAGS]
+005e ---- fd0e                         or          R7, R6
+005f ---- be01                         bnz         /noPowerDown
+
+                                           ; Assert the power-down request. We'll make sure that it has taken effect
+                                           ; or been completely ignored when waking up again
+0060 ---- 6436                             iobset      #0, [#IOP_WUC_PWRDWNREQ]
+               /noPowerDown:
+                                       ; Sleep until the next event
+0061 ---- bdb7 sleepInstr:             sleep
+
+
+
+
+0062 ---- 241a AdiDdiAcquire:          iobtst      #0, [#IOP_SMPH_SMPH0]
+0063 ---- a6fe                         biob0       AdiDdiAcquire
+0064 ---- adb7                         rts
+
+0065 ---- 641a AdiDdiRelease:          iobset      #0, [#IOP_SMPH_SMPH0]
+0066 ---- adb7                         rts
+
+
+
+
+               ; RTC ticks until next execution, one word for each task
+               pFwTaskExecuteScheduleTable:
+0067 ---- 0000                         dw          #0
+0068 ---- 0000                         dw          #0
+
+               ; Task code function pointers for each task code block, one word for each task
+               pFwTaskInitializeFuncTable:
+0069 ---- 0086                         dw          #cvTask/initialize
+006a ---- 0192                         dw          #sampleAdc/initialize
+               pFwTaskExecuteFuncTable:
+006b ---- 0108                         dw          #cvTask/execute
+006c ---- 0197                         dw          #sampleAdc/execute
+               pFwTaskTerminateFuncTable:
+006d ---- 0191                         dw          #cvTask/terminate
+006e ---- 01b6                         dw          #sampleAdc/terminate
+
+               ; Run-time logging log requests and masks, one bit for each struct, one word for each task
+               pRtlTaskLogReqTable:
+               ; (Run-time logging is not used in this project)
+               pRtlTaskLogMaskTable:
+               ; (Run-time logging is not used in this project)
+
+
+               ; Internal control data
+               fwCtrlInt:
+006f ---- 0000 /taskId:                dw          #0      ; ID of the currently running task
+0070 ---- 0000 /bvTaskIoAlert:         dw          #0x0000 ; LSB = Normal data exchange, MSB = Overflow or underflow
+0071 ---- ffff /alertGenMask:          dw          #0xFFFF ; Can generate an ALERT interrupt now? (0xFFFF = yes, 0x0000 = no)
+0072 ---- 0000 /alertCanPdAuxMask:     dw          #0x0000 ; Can power down AUX domain after ALERT interrupt generation? (0xFFFF = yes, 0x0000 = no)
+0073 ---- 0000 /rtlStructLockReq:      dw          #0x0000 ; Run-time logging struct lock request (0=idle -> 1=requested -> 2=ready -> access -> 0=idle)
+
+               ; External control data, shared with the driver
+               fwCtrlExt:
+0074 ---- 0000 /bvActiveTasks:         dw          #0x0000 ; Indicates which tasks are currently active
+0075 ---- 0000 /bvTaskIoAlert:         dw          #0x0000 ; LSB = Normal data exchange, MSB = Overflow or underflow
+0076 ---- 0000 /bvTaskInitializeReq:   dw          #0x0000 ; Requests tasks to start
+0077 ---- 0000 /bvTaskExecuteReq:      dw          #0x0000 ; Requests tasks to execute once immediately
+0078 ---- 0000 /bvTaskTerminateReq:    dw          #0x0000 ; Requests tasks to stop
+
+
+               .segment end "Framework"
+
+
+               fwTaskDataStructures:
+               .segment begin "Task: cvTask"
+               cvTask/cfg:
+               cvTask/cfg/TaskSelection:
+0079 ---- 0000                         dw          #0
+               cvTask/cfg/internalGain:
+007a ---- 0000                         dw          #0
+               cvTask/cfg/rtcPeriod:
+007b ---- 0001                         dw          #1
+               cvTask/cfg/rtcPeriodCA:
+007c ---- 0001                         dw          #1
+               cvTask/cfg/weSelect:
+007d ---- 0000                         dw          #0
+               cvTask/input:
+               cvTask/output:
+               cvTask/state:
+               cvTask/state/CAstate:
+007e ---- 0000                         dw          #0
+               cvTask/state/biasStep:
+007f ---- 0000                         dw          #0
+               cvTask/state/biasStepFlag:
+0080 ---- 0000                         dw          #0
+               cvTask/state/i2cStatus:
+0081 ---- 0000                         dw          #0
+               cvTask/state/lmpState:
+0082 ---- 0000                         dw          #0
+               cvTask/state/refcnRegValue:
+0083 ---- 0000                         dw          #0
+               cvTask/state/shotDownCVtask:
+0084 ---- 0000                         dw          #0
+               .segment end "Task: cvTask"
+               .segment begin "Task: sampleADC"
+               sampleAdc/cfg:
+               sampleAdc/input:
+               sampleAdc/output:
+               sampleAdc/output/adcValue:
+0085 ---- 0000                         dw          #0
+               sampleAdc/state:
+               .segment end "Task: sampleADC"
+
+
+               .segment begin "Task: cvTask"
+               cvTask/initialize:
+               ;? // Start I2C connection to LMP (LMP address 1001000 = 0x90)
+               ;? i2cStart();
+0086 ---- 6000                         ld          R6, #0x0000
+0087 ---- 15bd                         jsr         I2cStart
+0088 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;?
+               ;? // Select STATUS register to find turn-on status
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+0089 ---- 7090                         ld          R7, #144
+008a ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+008b ---- 15d4                         jsr         I2cTxByte
+008c ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_STATUS_REG_ADDR);
+008d ---- 7000                         ld          R7, #0
+008e ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+008f ---- 15d4                         jsr         I2cTxByte
+0090 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+0091 ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+0092 ---- 8a00                         cmp         R0, #0
+0093 ---- be0c                         bneq        /id0057
+               ;?     i2cRepeatedStart();
+0094 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+0095 ---- 15b7                             jsr         I2cRepeatedStart
+0096 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cTx(LMP_I2C_ADDR | I2C_OP_READ);
+0097 ---- 7091                             ld          R7, #145
+0098 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+0099 ---- 15d4                             jsr         I2cTxByte
+009a ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cRxNack(state.lmpState);
+009b ---- 7001                             ld          R7, #0x0001
+009c ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+009d ---- 15f2                             jsr         I2cRxByte
+009e ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+009f ---- 7c82                             st          R7, [#cvTask/state/lmpState]
+               ;? }
+               /id0057:
+               ;?
+               ;? // Select LOCK register to unlock TIACN and REFCN
+               ;? i2cRepeatedStart();
+00a0 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00a1 ---- 15b7                         jsr         I2cRepeatedStart
+00a2 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+00a3 ---- 7090                         ld          R7, #144
+00a4 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00a5 ---- 15d4                         jsr         I2cTxByte
+00a6 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_LOCK_REG_ADDR);
+00a7 ---- 7001                         ld          R7, #1
+00a8 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00a9 ---- 15d4                         jsr         I2cTxByte
+00aa ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+00ab ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+00ac ---- 8a00                         cmp         R0, #0
+00ad ---- be04                         bneq        /id0078
+               ;?     i2cTx(0x00); // Set TIACN and REFCN to write mode
+00ae ---- 7000                             ld          R7, #0
+00af ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00b0 ---- 15d4                             jsr         I2cTxByte
+00b1 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;? }
+               /id0078:
+               ;?
+               ;? // Select TIACN register to program internal gain
+               ;? i2cRepeatedStart();
+00b2 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00b3 ---- 15b7                         jsr         I2cRepeatedStart
+00b4 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+00b5 ---- 7090                         ld          R7, #144
+00b6 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00b7 ---- 15d4                         jsr         I2cTxByte
+00b8 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_TIACN_REG_ADDR);
+00b9 ---- 7010                         ld          R7, #16
+00ba ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00bb ---- 15d4                         jsr         I2cTxByte
+00bc ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+00bd ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+00be ---- 8a00                         cmp         R0, #0
+00bf ---- be04                         bneq        /id0094
+               ;?     i2cTx(cfg.internalGain);
+00c0 ---- 787a                             ld          R7, [#cvTask/cfg/internalGain]
+00c1 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00c2 ---- 15d4                             jsr         I2cTxByte
+00c3 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;? }
+               /id0094:
+               ;?
+               ;? // Select MODECN register to enable LMP
+               ;? i2cRepeatedStart();
+00c4 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00c5 ---- 15b7                         jsr         I2cRepeatedStart
+00c6 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+00c7 ---- 7090                         ld          R7, #144
+00c8 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00c9 ---- 15d4                         jsr         I2cTxByte
+00ca ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_MODECN_REG_ADDR);
+00cb ---- 7012                         ld          R7, #18
+00cc ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00cd ---- 15d4                         jsr         I2cTxByte
+00ce ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+00cf ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+00d0 ---- 8a00                         cmp         R0, #0
+00d1 ---- be04                         bneq        /id0110
+               ;?     i2cTx(0x03); // Set LMP to 3-lead cell mode, fetshort disabled
+00d2 ---- 7003                             ld          R7, #3
+00d3 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00d4 ---- 15d4                             jsr         I2cTxByte
+00d5 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;? }
+               /id0110:
+               ;?
+               ;? // Select REFCN register and initialize
+               ;? i2cRepeatedStart();
+00d6 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00d7 ---- 15b7                         jsr         I2cRepeatedStart
+00d8 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+00d9 ---- 7090                         ld          R7, #144
+00da ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00db ---- 15d4                         jsr         I2cTxByte
+00dc ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_REFCN_REG_ADDR);
+00dd ---- 7011                         ld          R7, #17
+00de ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00df ---- 15d4                         jsr         I2cTxByte
+00e0 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+00e1 ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+00e2 ---- 8a00                         cmp         R0, #0
+00e3 ---- be04                         bneq        /id0126
+               ;?     i2cTx(0x20);
+00e4 ---- 7020                             ld          R7, #32
+00e5 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00e6 ---- 15d4                             jsr         I2cTxByte
+00e7 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;? }
+               /id0126:
+               ;?
+               ;? i2cRepeatedStart();
+00e8 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00e9 ---- 15b7                         jsr         I2cRepeatedStart
+00ea ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+00eb ---- 7090                         ld          R7, #144
+00ec ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00ed ---- 15d4                         jsr         I2cTxByte
+00ee ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_REFCN_REG_ADDR);
+00ef ---- 7011                         ld          R7, #17
+00f0 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+00f1 ---- 15d4                         jsr         I2cTxByte
+00f2 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000 ) {
+00f3 ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+00f4 ---- 8a00                         cmp         R0, #0
+00f5 ---- be0c                         bneq        /id0142
+               ;?     i2cRepeatedStart();
+00f6 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00f7 ---- 15b7                             jsr         I2cRepeatedStart
+00f8 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cTx(LMP_I2C_ADDR | I2C_OP_READ);
+00f9 ---- 7091                             ld          R7, #145
+00fa ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00fb ---- 15d4                             jsr         I2cTxByte
+00fc ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cRxNack(state.refcnRegValue);
+00fd ---- 7001                             ld          R7, #0x0001
+00fe ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+00ff ---- 15f2                             jsr         I2cRxByte
+0100 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+0101 ---- 7c83                             st          R7, [#cvTask/state/refcnRegValue]
+               ;? }
+               /id0142:
+               ;?
+               ;? i2cStop();
+0102 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+0103 ---- 1611                         jsr         I2cStop
+0104 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;?
+               ;? // Schedule the first execution
+               ;? fwScheduleTask(cfg.rtcPeriod);
+0105 ---- 087b                         ld          R0, [#cvTask/cfg/rtcPeriod]
+0106 ---- 0c67                         st          R0, [#(pFwTaskExecuteScheduleTable + 0)]
+               cvTask/initializeDone:
+0107 ---- adb7                         rts
+
+
+
+
+               cvTask/execute:
+               ;? // Start I2C connection to LMP (LMP address 1001000 = 0x90)
+               ;? // Select REFCN register to program internal bias voltage
+               ;? i2cStart();
+0108 ---- 6000                         ld          R6, #0x0000
+0109 ---- 15bd                         jsr         I2cStart
+010a ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+010b ---- 7090                         ld          R7, #144
+010c ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+010d ---- 15d4                         jsr         I2cTxByte
+010e ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_REFCN_REG_ADDR);
+010f ---- 7011                         ld          R7, #17
+0110 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+0111 ---- 15d4                         jsr         I2cTxByte
+0112 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;?
+               ;? if (cfg.TaskSelection == 0) {
+0113 ---- 0879                         ld          R0, [#cvTask/cfg/TaskSelection]
+0114 ---- 8a00                         cmp         R0, #0
+0115 ---- be2e                         bneq        /id0166
+               ;?     // CV task shot down counter
+               ;?     state.shotDownCVtask = state.shotDownCVtask + 1;
+0116 ---- 0884                             ld          R0, [#cvTask/state/shotDownCVtask]
+0117 ---- 8801                             add         R0, #1
+0118 ---- 0c84                             st          R0, [#cvTask/state/shotDownCVtask]
+               ;?     // Set value to 0%-24%
+               ;?     i2cTx(0x20 | state.biasStep);
+0119 ---- 787f                             ld          R7, [#cvTask/state/biasStep]
+011a ---- f220                             or          R7, #32
+011b ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+011c ---- 15d4                             jsr         I2cTxByte
+011d ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     if (state.biasStepFlag == 0) {
+011e ---- 0880                             ld          R0, [#cvTask/state/biasStepFlag]
+011f ---- 8a00                             cmp         R0, #0
+0120 ---- be10                             bneq        /id0174
+               ;?         if (state.biasStep == 0) {
+0121 ---- 087f                                 ld          R0, [#cvTask/state/biasStep]
+0122 ---- 8a00                                 cmp         R0, #0
+0123 ---- be04                                 bneq        /id0177
+               ;?             state.biasStep = state.biasStep+2;
+0124 ---- 087f                                     ld          R0, [#cvTask/state/biasStep]
+0125 ---- 8802                                     add         R0, #2
+0126 ---- 0c7f                                     st          R0, [#cvTask/state/biasStep]
+               ;?         } else {
+0127 ---- 052b                                 jmp         /id0179
+               /id0177:
+               ;?             state.biasStep=state.biasStep+1;
+0128 ---- 087f                                     ld          R0, [#cvTask/state/biasStep]
+0129 ---- 8801                                     add         R0, #1
+012a ---- 0c7f                                     st          R0, [#cvTask/state/biasStep]
+               ;?         }
+               /id0179:
+               ;?
+               ;?         if (state.biasStep ==13) {
+012b ---- 087f                                 ld          R0, [#cvTask/state/biasStep]
+012c ---- 8a0d                                 cmp         R0, #13
+012d ---- be02                                 bneq        /id0182
+               ;?             state.biasStepFlag=1;
+012e ---- 0001                                     ld          R0, #1
+012f ---- 0c80                                     st          R0, [#cvTask/state/biasStepFlag]
+               ;?         }
+               /id0182:
+               ;?     } else if (state.biasStepFlag == 1) {
+0130 ---- 0543                             jmp         /id0176
+               /id0174:
+0131 ---- 0880                             ld          R0, [#cvTask/state/biasStepFlag]
+0132 ---- 8a01                             cmp         R0, #1
+0133 ---- be0f                             bneq        /id0185
+               ;?         if (state.biasStep == 2) {
+0134 ---- 087f                                 ld          R0, [#cvTask/state/biasStep]
+0135 ---- 8a02                                 cmp         R0, #2
+0136 ---- be04                                 bneq        /id0187
+               ;?             state.biasStep = state.biasStep-2;
+0137 ---- 087f                                     ld          R0, [#cvTask/state/biasStep]
+0138 ---- 88fe                                     add         R0, #-2
+0139 ---- 0c7f                                     st          R0, [#cvTask/state/biasStep]
+               ;?         } else {
+013a ---- 053e                                 jmp         /id0189
+               /id0187:
+               ;?             state.biasStep = state.biasStep-1;
+013b ---- 087f                                     ld          R0, [#cvTask/state/biasStep]
+013c ---- 88ff                                     add         R0, #-1
+013d ---- 0c7f                                     st          R0, [#cvTask/state/biasStep]
+               ;?         }
+               /id0189:
+               ;?
+               ;?         if (state.biasStep == 0) {
+013e ---- 087f                                 ld          R0, [#cvTask/state/biasStep]
+013f ---- 8a00                                 cmp         R0, #0
+0140 ---- be02                                 bneq        /id0192
+               ;?             state.biasStepFlag=0;
+0141 ---- 0000                                     ld          R0, #0
+0142 ---- 0c80                                     st          R0, [#cvTask/state/biasStepFlag]
+               ;?         }
+               /id0192:
+               ;?     }
+               /id0185:
+               /id0176:
+               ;? } else if (cfg.TaskSelection == 1) {
+0143 ---- 055a                         jmp         /id0168
+               /id0166:
+0144 ---- 0879                         ld          R0, [#cvTask/cfg/TaskSelection]
+0145 ---- 8a01                         cmp         R0, #1
+0146 ---- be13                         bneq        /id0195
+               ;?
+               ;?     //if (CAstate==0) 24% Vref
+               ;?     //else if (CAstate==1) 0% Vref
+               ;?     //else if (CAstate==2) shot down CA task
+               ;?     if (state.CAstate == 0) {
+0147 ---- 087e                             ld          R0, [#cvTask/state/CAstate]
+0148 ---- 8a00                             cmp         R0, #0
+0149 ---- be03                             bneq        /id0197
+               ;?         state.biasStep = 13;
+014a ---- 000d                                 ld          R0, #13
+014b ---- 0c7f                                 st          R0, [#cvTask/state/biasStep]
+               ;?     } else if (state.CAstate == 1) {
+014c ---- 0552                             jmp         /id0199
+               /id0197:
+014d ---- 087e                             ld          R0, [#cvTask/state/CAstate]
+014e ---- 8a01                             cmp         R0, #1
+014f ---- be02                             bneq        /id0201
+               ;?         state.biasStep = 0;
+0150 ---- 0000                                 ld          R0, #0
+0151 ---- 0c7f                                 st          R0, [#cvTask/state/biasStep]
+               ;?     }
+               /id0201:
+               /id0199:
+               ;?     state.CAstate = state.CAstate + 1;
+0152 ---- 087e                             ld          R0, [#cvTask/state/CAstate]
+0153 ---- 8801                             add         R0, #1
+0154 ---- 0c7e                             st          R0, [#cvTask/state/CAstate]
+               ;?     i2cTx(0x20 | state.biasStep);
+0155 ---- 787f                             ld          R7, [#cvTask/state/biasStep]
+0156 ---- f220                             or          R7, #32
+0157 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+0158 ---- 15d4                             jsr         I2cTxByte
+0159 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;? }
+               /id0195:
+               /id0168:
+               ;?
+               ;? i2cRepeatedStart();
+015a ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+015b ---- 15b7                         jsr         I2cRepeatedStart
+015c ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_I2C_ADDR | I2C_OP_WRITE);
+015d ---- 7090                         ld          R7, #144
+015e ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+015f ---- 15d4                         jsr         I2cTxByte
+0160 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? i2cTx(LMP_REFCN_REG_ADDR);
+0161 ---- 7011                         ld          R7, #17
+0162 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+0163 ---- 15d4                         jsr         I2cTxByte
+0164 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;? if (state.i2cStatus == 0x0000) {
+0165 ---- 0881                         ld          R0, [#cvTask/state/i2cStatus]
+0166 ---- 8a00                         cmp         R0, #0
+0167 ---- be0c                         bneq        /id0219
+               ;?     i2cRepeatedStart();
+0168 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+0169 ---- 15b7                             jsr         I2cRepeatedStart
+016a ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cTx(LMP_I2C_ADDR | I2C_OP_READ);
+016b ---- 7091                             ld          R7, #145
+016c ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+016d ---- 15d4                             jsr         I2cTxByte
+016e ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+               ;?     i2cRxNack(state.refcnRegValue);
+016f ---- 7001                             ld          R7, #0x0001
+0170 ---- 6881                             ld          R6, [#cvTask/state/i2cStatus]
+0171 ---- 15f2                             jsr         I2cRxByte
+0172 ---- 6c81                             st          R6, [#cvTask/state/i2cStatus]
+0173 ---- 7c83                             st          R7, [#cvTask/state/refcnRegValue]
+               ;? }
+               /id0219:
+               ;?
+               ;? i2cStop();
+0174 ---- 6881                         ld          R6, [#cvTask/state/i2cStatus]
+0175 ---- 1611                         jsr         I2cStop
+0176 ---- 6c81                         st          R6, [#cvTask/state/i2cStatus]
+               ;?
+               ;? //shot down cv and ca task
+               ;? if (state.shotDownCVtask == 30){
+0177 ---- 0884                         ld          R0, [#cvTask/state/shotDownCVtask]
+0178 ---- 8a1e                         cmp         R0, #30
+0179 ---- be03                         bneq        /id0232
+               ;?     fwGenAlertInterrupt();
+017a ---- 0870                             ld          R0, [#fwCtrlInt/bvTaskIoAlert]
+017b ---- 8201                             or          R0, #(1 << 0)
+017c ---- 0c70                             st          R0, [#fwCtrlInt/bvTaskIoAlert]
+               ;? }
+               /id0232:
+               ;?
+               ;? if (state.CAstate == 2){
+017d ---- 087e                         ld          R0, [#cvTask/state/CAstate]
+017e ---- 8a02                         cmp         R0, #2
+017f ---- be05                         bneq        /id0235
+               ;?     state.CAstate = 0;
+0180 ---- 0000                             ld          R0, #0
+0181 ---- 0c7e                             st          R0, [#cvTask/state/CAstate]
+               ;?     fwGenAlertInterrupt();
+0182 ---- 0870                             ld          R0, [#fwCtrlInt/bvTaskIoAlert]
+0183 ---- 8201                             or          R0, #(1 << 0)
+0184 ---- 0c70                             st          R0, [#fwCtrlInt/bvTaskIoAlert]
+               ;? }
+               /id0235:
+               ;?
+               ;? if (cfg.TaskSelection == 0) {
+0185 ---- 0879                         ld          R0, [#cvTask/cfg/TaskSelection]
+0186 ---- 8a00                         cmp         R0, #0
+0187 ---- be03                         bneq        /id0239
+               ;?     fwScheduleTask(cfg.rtcPeriod);
+0188 ---- 087b                             ld          R0, [#cvTask/cfg/rtcPeriod]
+0189 ---- 0c67                             st          R0, [#(pFwTaskExecuteScheduleTable + 0)]
+               ;? } else if (cfg.TaskSelection == 1) {
+018a ---- 0590                         jmp         /id0241
+               /id0239:
+018b ---- 0879                         ld          R0, [#cvTask/cfg/TaskSelection]
+018c ---- 8a01                         cmp         R0, #1
+018d ---- be02                         bneq        /id0243
+               ;?     fwScheduleTask(cfg.rtcPeriodCA);
+018e ---- 087c                             ld          R0, [#cvTask/cfg/rtcPeriodCA]
+018f ---- 0c67                             st          R0, [#(pFwTaskExecuteScheduleTable + 0)]
+               ;? }
+               /id0243:
+               /id0241:
+               cvTask/executeDone:
+0190 ---- adb7                         rts
+
+
+
+
+               cvTask/terminate:
+               ;? // Clear all MUX pins
+               ;?
+               ;? // Put LMP into standby mode to reduce power consumption
+               cvTask/terminateDone:
+0191 ---- adb7                         rts
+               .segment end "Task: cvTask"
+               .segment begin "Task: sampleADC"
+               sampleAdc/initialize:
+               ;? // Select ADC Input
+               ;? adcSelectGpioInput(AUXIO_A_ADC_IN);
+0192 ---- 7003                         ld          R7, #3
+0193 ---- 161c                         jsr         AdccompbSelectGpioInput
+               ;?
+               ;? // Schedule first sample
+               ;? fwScheduleTask(1);
+0194 ---- 0001                         ld          R0, #1
+0195 ---- 0c68                         st          R0, [#(pFwTaskExecuteScheduleTable + 1)]
+               sampleAdc/initializeDone:
+0196 ---- adb7                         rts
+
+
+
+
+               sampleAdc/execute:
+               ;? // Enable the ADC
+               ;? adcEnableSync(ADC_REF_VDDS_REL, ADC_SAMPLE_TIME_2P7_US, ADC_TRIGGER_MANUAL);
+0197 ---- 7009                         ld          R7, #((8 | (((3 < 6) & (!8)) * ADI16_ADCREF_REF_ON_IDLE)) | ADI16_ADCREF_EN)
+0198 ---- 1462                         jsr         AdiDdiAcquire
+0199 ---- fb4d                         out         R7, [#IOP_ADISET_ADCREF]
+019a 8609 7101                         ld          R7, #((9 << IOB_ANAIF_ADCCTL_START_SRC) | 0x0001)
+019c ---- 6431                         iobset      #IOB_WUC_ADCCLKCTL_REQ, [#IOP_WUC_ADCCLKCTL]
+               /id0064:
+019d ---- 2531                         iobtst      #IOB_WUC_ADCCLKCTL_ACK, [#IOP_WUC_ADCCLKCTL]
+019e ---- a6fe                         biob0       /id0064
+019f ---- fb00                         out         R7, [#IOP_ANAIF_ADCCTL]
+01a0 ---- 7078                         ld          R7, #BV_ADI16_ADC_SMPL_CYCLE_EXP
+01a1 ---- fb54                         out         R7, [#IOP_ADICLR_ADC]
+01a2 ---- 7018                         ld          R7, #(3 << BI_ADI16_ADC_SMPL_CYCLE_EXP)
+01a3 ---- fb4c                         out         R7, [#IOP_ADISET_ADC]
+01a4 ---- 7003                         ld          R7, #(ADI16_ADC_EN | ADI16_ADC_RESET_N)
+01a5 ---- fb4c                         out         R7, [#IOP_ADISET_ADC]
+01a6 ---- fd47                         nop
+01a7 ---- fb4c                         out         R7, [#IOP_ADISET_ADC]
+01a8 ---- 1465                         jsr         AdiDdiRelease
+               ;?
+               ;? // Sample the analog sensor
+               ;? adcGenManualTrigger();
+01a9 ---- 6403                         iobset      #0, [#IOP_ANAIF_ADCTRIG]
+               ;? adcReadFifo(output.adcValue);
+01aa ---- 001f                         ld          R0, #EVCTL_SCEEVSEL_ADC_FIFO_NOT_EMPTY
+01ab ---- 8b2c                         out         R0, [#IOP_EVCTL_SCEWEVSEL]
+01ac ---- fdb1                         wev1        #WEVSEL_PROG
+01ad ---- 8902                         in          R0, [#IOP_ANAIF_ADCFIFO]
+01ae ---- 0c85                         st          R0, [#sampleAdc/output/adcValue]
+               ;?
+               ;? // disable the ADC
+               ;? adcDisable();
+01af ---- 1629                         jsr         AdcDisable
+               ;?
+               ;? fwGenAlertInterrupt(); // Signal main application of new reading
+01b0 ---- 0870                         ld          R0, [#fwCtrlInt/bvTaskIoAlert]
+01b1 ---- 8202                         or          R0, #(1 << 1)
+01b2 ---- 0c70                         st          R0, [#fwCtrlInt/bvTaskIoAlert]
+               ;?
+               ;? // Schedule next sampling
+               ;? fwScheduleTask(1);
+01b3 ---- 0001                         ld          R0, #1
+01b4 ---- 0c68                         st          R0, [#(pFwTaskExecuteScheduleTable + 1)]
+               sampleAdc/executeDone:
+01b5 ---- adb7                         rts
+
+
+
+
+               sampleAdc/terminate:
+               ;?
+               sampleAdc/terminateDone:
+01b6 ---- adb7                         rts
+               .segment end "Task: sampleADC"
+
+
+               .segment begin "Procedure Libary"
+               ; CLOBBERS:
+               ;     R5
+               I2cRepeatedStart:
+                                       ; Wait T_LOW (SDA is already pull-up)
+01b7 ---- 53c6                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (1))
+01b8 ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = pull-up
+01b9 ---- 670f                         iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Wait for SCL stretching to end or time out
+01ba ---- 15c5                         jsr         I2cWaitSclStretch
+
+                                       ; Wait T_SU_STA
+01bb ---- 53c6                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (1))
+01bc ---- 15c2                         jsr         I2cWaitDelay
+               I2cStart:
+                                       ; SDA = driven low
+01bd ---- 460e                         iobclr      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+
+                                       ; Wait T_HD_STA
+01be ---- 53ca                         ld          R5, #-((I2C_BASE_DELAY) - (1))
+01bf ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = driven low
+01c0 ---- 470f                         iobclr      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Done
+01c1 ---- adb7                         rts
+
+
+
+
+               ; PARAMETERS
+               ;     R5 = Delay excluding the I2cWaitDelay() call, in instruction cycles
+               ;
+               ; CLOBBERS:
+               ;     R5
+               I2cWaitDelay:
+                                       ; Wait for the specified number of cycles
+01c2 ---- d802 /waitLoop:                  add         R5, #2
+01c3 ---- defe                         bneg        /waitLoop
+
+                                       ; Done
+01c4 ---- adb7                         rts
+
+
+
+
+               ; PARAMETERS:
+               ;     R6 = Status flags
+               ;
+               ; RETURN VALUES:
+               ;     R6 = Updated status flags
+               ;
+               ; CLOBBERS:
+               ;     R5
+               I2cWaitSclStretch:
+                                       ; Load the timeout (up to 20 ms) loop counter = configured number of us
+01c5 ---- 539c                         ld          R5, #(-I2C_STRETCH_TIMEOUT_US)
+               /waitLoop:
+                                           ; If SCL is high, we're done
+01c6 ---- 2713                             iobtst      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SCL >> 3))]
+01c7 ---- ae0b                             biob1       /done
+                                           ; Unroll the loop to 12 instructions = 1 per loop for faster response
+01c8 ---- 2713                             iobtst      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SCL >> 3))]
+01c9 ---- ae09                             biob1       /done
+01ca ---- 2713                             iobtst      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SCL >> 3))]
+01cb ---- ae07                             biob1       /done
+01cc ---- 2713                             iobtst      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SCL >> 3))]
+01cd ---- ae05                             biob1       /done
+01ce ---- 2713                             iobtst      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SCL >> 3))]
+01cf ---- ae03                             biob1       /done
+
+01d0 ---- d801                         add         R5, #1;
+01d1 ---- bef4                         bnz         /waitLoop
+
+               /timeout:               ; Timeout has occurred, so OR it into the flags and bail out
+01d2 ---- e202                         or          R6, #0x0002
+
+               /done:                  ; Done
+01d3 ---- adb7                         rts
+
+
+
+
+               ; PARAMETERS:
+               ;     R7 = TX byte shift register
+               ;     R6 = Status flags
+               ;
+               ; RETURN VALUES:
+               ;     R7 = Updated TX byte shift register
+               ;     R6 = Updated status flags
+               ;
+               ; CLOBBERS:
+               ;     R5
+               I2cTxByte:
+                                       ; Bail out if an error has occurred
+01d4 ---- ea00                         cmp         R6, #0
+01d5 ---- be1b                         bnz         /done
+
+
+                                       ; Transmit each bit in the data byte ...
+01d6 ---- b50e                         loop        #8, /byteLoopEnd
+
+                                           ; Output the bit to SDA
+01d7 ---- fda1                             lsl         R7, #1
+01d8 8601 fc00                             tst         R7, #0x0100
+01da ---- b602                             bz          /dataSdaLow
+01db ---- 660e /dataSdaHigh:                   iobset      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+01dc ---- 8e02                             bra         /dataSdaDone
+01dd ---- 460e /dataSdaLow:                    iobclr      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+01de ---- fd47                             nop
+               /dataSdaDone:
+                                           ; Wait T_LOW
+01df ---- 53cc                             ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (7))
+01e0 ---- 15c2                             jsr         I2cWaitDelay
+
+                                           ; SCL = pull-up
+01e1 ---- 670f                             iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                           ; Wait for SCL stretching to end or time out
+01e2 ---- 15c5                             jsr         I2cWaitSclStretch
+
+                                           ; Wait T_HIGH
+01e3 ---- 53cf                             ld          R5, #-(I2C_BASE_DELAY - (I2C_WAIT_STRETCH_DELAY + 1))
+01e4 ---- 15c2                             jsr         I2cWaitDelay
+
+                                           ; SCL = driven low
+01e5 ---- 470f                             iobclr      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+               /byteLoopEnd:
+
+                                       ; Receive the ACK bit
+                                       ; SDA = pull-up
+01e6 ---- 660e                         iobset      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+
+                                       ; Wait T_LOW
+01e7 ---- 53c6                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (1))
+01e8 ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = pull-up
+01e9 ---- 670f                         iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Wait for SCL stretching to end or time out
+01ea ---- 15c5                         jsr         I2cWaitSclStretch
+
+                                       ; Wait T_HIGH
+01eb ---- 53cc                         ld          R5, #-((I2C_BASE_DELAY) - (3))
+01ec ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; Read and store the SDA value in the status word
+01ed ---- 2612                         iobtst      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SDA >> 3))]
+01ee ---- a601                         biob0       /ackSdaLow
+01ef ---- e201                             or          R6, #0x01
+               /ackSdaLow:
+                                       ; SCL = driven low
+01f0 ---- 470f                         iobclr      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+
+               /done:                  ; Done
+01f1 ---- adb7                         rts
+
+
+
+
+               ; PARAMETERS:
+               ;     R7 = Acknowledgment bit value, 0x0000 to transmit ACK, 0x0001 to transmit NAK
+               ;     R6 = Status flags
+               ;
+               ; RETURN VALUES:
+               ;     R7 = RX byte shift register
+               ;     R6 = Updated status flags
+               ;
+               ; CLOBBERS:
+               ;     R5
+               I2cRxByte:
+                                       ; Bail out if an error has occurred
+01f2 ---- ea00                         cmp         R6, #0
+01f3 ---- be1c                         bnz         /done
+
+
+                                       ; Receive each bit in the data byte ...
+01f4 ---- b50b                         loop        #8, /byteLoopEnd
+
+                                           ; SDA = pull-up
+01f5 ---- 660e                             iobset      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+
+                                           ; Wait T_LOW
+01f6 ---- 53c7                             ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (2))
+01f7 ---- 15c2                             jsr         I2cWaitDelay
+
+                                           ; SCL = pull-up
+01f8 ---- 670f                             iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                           ; Wait for SCL stretching to end or time out
+01f9 ---- 15c5                             jsr         I2cWaitSclStretch
+
+                                           ; Wait T_HIGH
+01fa ---- 53d1                             ld          R5, #-((I2C_BASE_DELAY) - (I2C_WAIT_STRETCH_DELAY + 3))
+01fb ---- 15c2                             jsr         I2cWaitDelay
+
+                                           ; Read and store SDA
+01fc ---- fda1                             lsl         R7, #1
+01fd ---- 2612                             iobtst      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODIN + (AUXIO_I2C_SDA >> 3))]
+01fe ---- a601                             biob0       /dataSdaLow
+01ff ---- f201                                 or          R7, #0x01
+               /dataSdaLow:
+                                           ; SCL = driven low
+0200 ---- 470f                             iobclr      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+               /byteLoopEnd:
+
+                                       ; Transmit the ACK bit, which is now in bit 8 of the shift register
+                                       ; Output the bit to SDA
+0201 8601 fc00                         tst         R7, #0x0100
+0203 ---- b602                         bz          /ackSdaLow
+0204 ---- 660e /ackSdaHigh:                iobset      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+0205 ---- 8e02                         bra         /ackSdaDone
+0206 ---- 460e /ackSdaLow:                 iobclr      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+0207 ---- fd47                         nop
+               /ackSdaDone:
+                                       ; Wait T_LOW
+0208 ---- 53cb                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (6))
+0209 ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = pull-up
+020a ---- 670f                         iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Wait for SCL stretching to end or time out
+020b ---- 15c5                         jsr         I2cWaitSclStretch
+
+                                       ; Wait T_HIGH
+020c ---- 53cf                         ld          R5, #-((I2C_BASE_DELAY) - (I2C_WAIT_STRETCH_DELAY + 1))
+020d ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = driven low
+020e ---- 470f                         iobclr      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Mask the ACK bit in the received data
+020f ---- f0ff                         and         R7, #0xFF
+
+
+               /done:                  ; Done
+0210 ---- adb7                         rts
+
+
+
+
+               ; CLOBBERS:
+               ;     R5
+               I2cStop:
+                                       ; SDA = driven low
+0211 ---- 460e                         iobclr      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+
+                                       ; Wait T_LOW
+0212 ---- 53c6                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (1))
+0213 ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SCL = pull-up
+0214 ---- 670f                         iobset      #(AUXIO_I2C_SCL & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SCL >> 3))]
+
+                                       ; Wait for SCL stretching to end or time out
+0215 ---- 15c5                         jsr         I2cWaitSclStretch
+
+                                       ; Wait T_SU_STO
+0216 ---- 53cf                         ld          R5, #-((I2C_BASE_DELAY) - (I2C_WAIT_STRETCH_DELAY + 1))
+0217 ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; SDA = pull-up
+0218 ---- 660e                         iobset      #(AUXIO_I2C_SDA & 0x7), [#(IOP_AIODIO0_GPIODOUT + (AUXIO_I2C_SDA >> 3))]
+
+                                       ; Wait T_BUF
+0219 ---- 53c7                         ld          R5, #-((I2C_BASE_DELAY + I2C_EXT_DELAY) - (2))
+021a ---- 15c2                         jsr         I2cWaitDelay
+
+                                       ; Done
+021b ---- adb7                         rts
+
+
+
+
+               ; PARAMETERS:
+               ;     R7 = AUX I/O index (0-7)
+               ;
+               ; CLOBBERS:
+               ;     R6, R7
+               AdccompbSelectGpioInput:
+                                       ; Make sure that the AUX I/O index is valid
+021c ---- f007                         and         R7, #0x0007
+
+                                       ; Disconnect all signals
+021d ---- 1462                         jsr         AdiDdiAcquire
+021e 86ff 63f8                         ld          R6, #(BV_ADI16_MUX2_ADCCOMPB_IN | BV_ADI16_MUX3_ADCCOMPB_IN)
+0220 ---- eb51                         out         R6, [#IOP_ADICLR_MUX2_MUX3]
+
+                                       ; Connect the specified GPIO
+0221 8680 6000                         ld          R6, #ADI16_MUX3_ADCCOMPB_IN_AUXIO0
+0223 ---- ed8f                         lsr         R6, R7
+0224 ---- eb49                         out         R6, [#IOP_ADISET_MUX2_MUX3]
+
+                                       ; Ensure that it has taken effect
+0225 ---- fd47                         nop         ; Workaround for back-to-back ADI/DDI accesses
+0226 ---- eb49                         out         R6, [#IOP_ADISET_MUX2_MUX3]
+0227 ---- 1465                         jsr         AdiDdiRelease
+0228 ---- adb7                         rts
+
+
+
+
+               ; CLOBBERS:
+               ;     R7
+               AdcDisable:
+                                       ; Disable the ADC reference
+0229 ---- 1462                         jsr         AdiDdiAcquire
+022a ---- 7079                         ld          R7, #((ADI16_ADCREF_EN | ADI16_ADCREF_REF_ON_IDLE) | (ADI16_ADCREF_SRC | (ADI16_ADCREF_EXT | ADI16_ADCREF_IOMUX)))
+022b ---- fb55                         out         R7, [#IOP_ADICLR_ADCREF]
+
+                                       ; Assert reset and disable the ADC
+022c ---- 71fb                         ld          R7, #((ADI16_ADC_EN | ADI16_ADC_RESET_N) | (BV_ADI16_ADC_SMPL_CYCLE_EXP | (BV_ADI16_ADC_SMPL_MODE | ADI16_ADC_SCALE_DIS)))
+022d ---- fb54                         out         R7, [#IOP_ADICLR_ADC]
+
+                                       ; Ensure that it has taken effect
+022e ---- fd47                         nop         ; Workaround for back-to-back ADI/DDI accesses
+022f ---- fb54                         out         R7, [#IOP_ADICLR_ADC]
+0230 ---- 1465                         jsr         AdiDdiRelease
+
+                                       ; Disable the ADC clock (no need to wait since IOB_WUC_ADCCLKCTL_ACK goes low immediately)
+0231 ---- 4431                         iobclr      #IOB_WUC_ADCCLKCTL_REQ, [#IOP_WUC_ADCCLKCTL]
+
+                                       ; Disable the ADC data interface
+0232 ---- 4400                         iobclr      #0, [#IOP_ANAIF_ADCCTL]
+
+0233 ---- adb7                         rts
+               .segment end "Procedure Libary"
+
+
+; Generated by DESKTOP-2MAQ27I at 2019-08-29 15:32:51.881
